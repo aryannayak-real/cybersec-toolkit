@@ -1,0 +1,155 @@
+name: Update uv dependencies
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Every Monday at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Resolve and verify the upgraded lockfile with NO write-scoped token in scope:
+  # this job installs and runs freshly-upgraded, unreviewed dependencies, so it must
+  # not be able to push, open a PR, or leave a usable token behind. It hands the
+  # verified uv.lock to the write-scoped job below as an artifact.
+  lock-and-verify:
+    name: Resolve and verify upgrade
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.upgrade.outputs.changed }}
+      summary: ${{ steps.upgrade.outputs.summary }}
+      lock_sha256: ${{ steps.upgrade.outputs.lock_sha256 }}
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: $/.github/actions/setup-uv
+        with:
+          # This job runs freshly upgraded packages; keep them out of the shared cache.
+          enable-cache: false
+
+      - name: Upgrade all packages in uv.lock
+        id: upgrade
+        run: |
+          cd mcp_server
+          cp uv.lock uv.lock.old
+          # pyproject.toml sets [tool.uv] exclude-newer = "5 days" to avoid
+          # locking package releases during their highest-risk window.
+          uv lock --upgrade
+          if diff -q uv.lock uv.lock.old > /dev/null 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No dependency updates available."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            # Recorded before any upgraded package runs, and checked again by the job that opens the PR.
+            echo "lock_sha256=$(sha256sum uv.lock | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+            diff uv.lock.old uv.lock | grep '^[<>].*version' | head -30 > /tmp/diff_summary.txt || true
+            {
+              echo 'summary<<EOF'
+              cat /tmp/diff_summary.txt
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          fi
+          rm -f uv.lock.old
+
+      - name: Verify upgraded lockfile (sync, import, lint, tests, audit, sync-check)
+        if: steps.upgrade.outputs.changed == 'true'
+        run: |
+          cd mcp_server && uv sync --locked --quiet
+          uv run python -c "
+          import sys; sys.path.insert(0, '..')
+          from mcp_server.server import mcp, _db
+          assert _db.total_tools > 600, f'Expected 600+ tools (registry sanity floor), got {_db.total_tools}'
+          print(f'MCP server OK: {_db.total_tools} tools')
+          "
+          uv run --group dev ruff check .
+          uv run --group dev ruff format --check .
+          uv run --group dev python -m pytest tests/ -q
+          cd ..
+          # Same audit as security.yml: every pinned version, extras included.
+          bash scripts/pip-audit-lock.sh
+          python3 scripts/validate_mcp_sync.py
+
+      - name: Upload verified lockfile
+        if: steps.upgrade.outputs.changed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: uv-lock
+          path: mcp_server/uv.lock
+          retention-days: 1
+
+  # Open the PR with the verified lockfile. This job holds the write-scoped token
+  # but never runs any upgraded dependency: it only restores the artifact produced
+  # above (no `uv lock`/`uv sync` here, which could build sdists and execute code).
+  open-pr:
+    name: Open dependency PR
+    needs: lock-and-verify
+    if: needs.lock-and-verify.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore verified lockfile
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: uv-lock
+          path: mcp_server
+
+      - name: Check the lockfile is the one that was resolved
+        env:
+          LOCK_SHA256: ${{ needs.lock-and-verify.outputs.lock_sha256 }}
+        run: echo "${LOCK_SHA256}  mcp_server/uv.lock" | sha256sum -c -
+
+      - name: Create pull request
+        id: cpr
+        uses: peter-evans/create-pull-request@15733dbdfeedb4f7fdb73d13c6f5ac83b710fab8 # v8.1.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: bump uv dependencies"
+          branch: auto/uv-update
+          delete-branch: true
+          title: "chore: bump uv dependencies"
+          add-paths: mcp_server/uv.lock
+          body: |
+            Automated weekly dependency update for `mcp_server/uv.lock`.
+
+            ```
+            ${{ needs.lock-and-verify.outputs.summary }}
+            ```
+
+            Verified against the upgraded lock in a separate read-only job: `uv sync`, MCP import check, `ruff check`/`format --check`, `pytest`, `pip-audit`, and `validate_mcp_sync.py` all passed before this PR was opened.
+          labels: dependencies
+
+      - name: Enable auto-merge
+        if: steps.cpr.outputs.pull-request-number != ''
+        run: |
+          gh pr merge --auto --squash "$PR_NUMBER" || true
+          # If this fails with "Auto merge is not allowed", enable it under
+          # repo Settings → General → Pull Requests → Allow auto-merge.
+          # Branch protection's required approvals/checks still gate the actual merge.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.cpr.outputs.pull-request-number }}

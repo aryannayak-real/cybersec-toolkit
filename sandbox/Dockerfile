@@ -1,0 +1,61 @@
+# A named stage (not COPY --from=<image>) so Dependabot tracks the uv image.
+FROM ghcr.io/astral-sh/uv:0.13.8@sha256:5cc1805e2426484abca4ad46ea783bab281fdb225fd82d8ce6d66a81254bac85 AS uv
+
+FROM ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944
+
+ENV DEBIAN_FRONTEND=noninteractive
+# The base image ships an unpackaged pebble Go binary (known HIGH CVEs) that
+# this project never uses; drop it so image scanners stay clean.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
+        bash ca-certificates curl file git binutils nmap nftables python3 python3-venv \
+    && rm -rf /usr/bin/pebble /var/lib/pebble \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=uv /uv /usr/local/bin/uv
+
+WORKDIR /opt/cybersec-toolkit
+# Copy only runtime and installer sources; local credentials never enter layers.
+COPY mcp_server/*.py mcp_server/pyproject.toml mcp_server/uv.lock mcp_server/README.md ./mcp_server/
+COPY tools_config.json install.sh ./
+COPY lib/ ./lib/
+COPY modules/ ./modules/
+COPY profiles/ ./profiles/
+COPY scripts/ ./scripts/
+COPY sandbox/guest-mcp.json ./sandbox/guest-mcp.json
+RUN uv sync --directory mcp_server --frozen --no-dev --no-editable
+
+# Stamp the image with a hash of the server/policy sources it was built from, so
+# `install.sh --doctor` can report an image built before a later server change.
+ARG SANDBOX_SOURCE_HASH="unknown"
+LABEL cybersec.sandbox.source_hash="${SANDBOX_SOURCE_HASH}"
+
+# Additional tool profiles are installed at build time, before dropping privilege.
+# The run_script venvs go to a shared path: the build runs as root (HOME=/root,
+# mode 0700), which the unprivileged runtime user could not reach.
+ENV CYBERSEC_MCP_VENVS_DIR=/opt/ctf-venvs
+ARG TOOLKIT_PROFILE=""
+RUN if [ -n "$TOOLKIT_PROFILE" ]; then \
+        bash install.sh --profile "$TOOLKIT_PROFILE" --production --yes; \
+    fi
+
+RUN groupadd --gid 10001 toolkit \
+    && useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash toolkit \
+    && install -d -o 10001 -g 10001 /workspace /var/log/cybersec \
+    && rm -f /etc/sudoers.d/toolkit \
+    && find /usr /opt -xdev -type f -perm /6000 -exec chmod a-s {} +
+
+ENV HOME=/home/toolkit \
+    UV_NO_SYNC=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    CYBERSEC_INSTALLER_ROOT=/opt/cybersec-toolkit \
+    CYBERSEC_MCP_ALLOW_EXTERNAL=0 \
+    CYBERSEC_MCP_ALLOW_SCRIPTS=0 \
+    CYBERSEC_MCP_AUDIT_REQUIRED=1 \
+    CYBERSEC_MCP_AUDIT_STREAM=1 \
+    CYBERSEC_MCP_AUDIT_LOG=/var/log/cybersec/audit.log
+USER 10001:10001
+WORKDIR /workspace
+# -P keeps the /workspace cwd off sys.path so a mounted file cannot shadow a
+# server module (the package is installed non-editable in the venv).
+ENTRYPOINT ["/opt/cybersec-toolkit/mcp_server/.venv/bin/python", "-P", "-m", "mcp_server.server"]

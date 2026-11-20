@@ -1,0 +1,4 @@
+# Known vulnerabilities to ignore in pip-audit.
+# Each line is a CVE/PYSEC ID. Remove entries once a fixed version is available.
+#
+# (none currently)

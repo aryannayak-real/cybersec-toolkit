@@ -1,0 +1,623 @@
+/**
+ * kata.mjs — Kata Containers sandbox provider for Sandcastle.
+ *
+ * Sandcastle's bundled Docker provider cannot select an alternative OCI runtime,
+ * so its containers share the host kernel. This provider drives the docker CLI
+ * but pins a Kata runtime, which puts a hardware-virtualized boundary between
+ * security tooling and the host. Podman cannot host Kata 2.x+: Kata ships only
+ * a containerd shim v2, and Podman drives OCI CLI runtimes.
+ *
+ * The returned provider satisfies Sandcastle's isolated-provider contract, so it
+ * can be handed to run()/createSandbox() for agent orchestration or driven
+ * directly, as sandbox/mcp.mjs does for the stdio MCP transport.
+ *
+ * See docs/SANDBOX.md for host prerequisites and configuration.
+ */
+
+import { execFile, execFileSync, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { isAbsolute, resolve, sep } from 'node:path';
+import { createInterface } from 'node:readline';
+
+import { createIsolatedSandboxProvider } from '@ai-hero/sandcastle';
+
+import { applyScope, buildHostArgs, loadScope, resolveScope, summarize } from './scope.mjs';
+
+export const SANDBOX_LABEL_KEY = 'cybersec-toolkit.sandbox';
+export const SANDBOX_LABEL_VALUE = 'kata';
+export const WORKTREE_PATH = '/workspace';
+export const DEFAULT_IMAGE = 'cybersec-toolkit-sandbox:latest';
+export const BUILD_HINT = 'make sandbox-image';
+const SOURCE_HASH_LABEL = 'cybersec.sandbox.source_hash';
+
+const DEFAULT_USER = '10001:10001';
+const DEFAULT_MEMORY = '2g';
+const DEFAULT_CPUS = '2';
+const DEFAULT_PIDS_LIMIT = '512';
+const DEFAULT_SCRATCH_SIZE = '1g';
+// The only guest paths left writable once the root filesystem is read-only.
+const SCRATCH_PATHS = ['/tmp', '/var/tmp', '/home/toolkit', '/var/log/cybersec'];
+const MAX_TAIL_CHARS = 64 * 1024;
+// Runtime names Kata registers under, most specific first.
+const KATA_RUNTIME_PREFERENCE = ['kata', 'kata-runtime', 'kata-qemu', 'io.containerd.kata.v2'];
+
+const asString = (value) => (value === undefined || value === null ? undefined : String(value));
+const truthy = (value) => ['1', 'true', 'yes'].includes((value ?? '').trim().toLowerCase());
+
+/** Whether a runtime name denotes Kata, i.e. an actual VM boundary. */
+export const isKataRuntime = (name) => /kata/i.test(name ?? '');
+
+// The sandbox marker the audit trail records. Claim 'kata' only when the VM
+// boundary is checked (Kata runtime, boot-ID check not skipped by the unsafe
+// opt-in); anything else is labelled with the runtime that actually ran.
+export const sandboxModeLabel = (runtime, allowUnsafe) =>
+  isKataRuntime(runtime) && !allowUnsafe ? 'kata' : `unsafe:${runtime}`;
+
+const assertKataRuntime = (name, allowUnsafe) => {
+  // A non-Kata runtime is a namespace container sharing the host kernel — the
+  // thing this provider exists to avoid — so it is never silently used.
+  if (isKataRuntime(name) || allowUnsafe) return name;
+  throw new Error(
+    `Runtime '${name}' is not a Kata runtime: tools would share the host kernel with no VM boundary. ` +
+      'Set CYBERSEC_SANDBOX_ALLOW_UNSAFE_RUNTIME=1 to accept that deliberately (a CI smoke test, say).',
+  );
+};
+
+// Per-boot random UUID; not namespaced, so a container that shares the host
+// kernel reads the host's value, while a VM has its own.
+export const BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id';
+
+const readHostBootId = () => {
+  try {
+    return readFileSync(BOOT_ID_PATH, 'utf8').trim();
+  } catch {
+    return '';
+  }
+};
+
+/**
+ * Assert the started sandbox is a VM, not a namespace container.
+ *
+ * The runtime name is chosen by whoever configured Docker, so a non-Kata
+ * runtime registered under a kata-ish name passes the name check while sharing
+ * the host kernel. An identical boot id proves that sharing; a real VM boots
+ * its own kernel and gets its own id. Boot ids are random per boot, so a match
+ * is not coincidence. Fails closed when either id is unreadable.
+ */
+export const assertVmBoundary = (guestBootId, hostBootId, runtime) => {
+  if (!hostBootId || !guestBootId) {
+    throw new Error(
+      `Runtime '${runtime}': could not confirm a VM boundary (boot id unavailable). ` +
+        'Set CYBERSEC_SANDBOX_ALLOW_UNSAFE_RUNTIME=1 to run without one deliberately.',
+    );
+  }
+  if (guestBootId === hostBootId) {
+    throw new Error(
+      `Runtime '${runtime}' shares the host kernel (identical boot id): no VM boundary. ` +
+        'It is named like Kata but does not isolate the guest. ' +
+        'Set CYBERSEC_SANDBOX_ALLOW_UNSAFE_RUNTIME=1 to accept a non-VM runtime deliberately.',
+    );
+  }
+};
+
+const parseCapabilities = (raw) => {
+  if (raw === undefined) return [];
+  const caps = (Array.isArray(raw) ? raw : String(raw).split(',')).map((c) => c.trim()).filter(Boolean);
+  for (const cap of caps) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(cap)) {
+      throw new Error(`Invalid capability '${cap}': expected a name such as NET_RAW.`);
+    }
+  }
+  return caps;
+};
+
+/** Merge explicit options with their environment fallbacks and defaults. */
+export const resolveOptions = (options = {}, env = process.env) => {
+  const pick = (value, name) => asString(value) ?? (env[name] ? String(env[name]) : undefined);
+
+  const workspace = pick(options.workspace, 'CYBERSEC_SANDBOX_WORKSPACE');
+  if (workspace !== undefined && !isAbsolute(workspace)) {
+    throw new Error(`CYBERSEC_SANDBOX_WORKSPACE must be an absolute path, got '${workspace}'.`);
+  }
+
+  return {
+    image: pick(options.image, 'CYBERSEC_SANDBOX_IMAGE') ?? DEFAULT_IMAGE,
+    runtime: pick(options.runtime, 'CYBERSEC_SANDBOX_RUNTIME'),
+    network: pick(options.network, 'CYBERSEC_SANDBOX_NETWORK'),
+    user: pick(options.user, 'CYBERSEC_SANDBOX_USER') ?? DEFAULT_USER,
+    memory: pick(options.memory, 'CYBERSEC_SANDBOX_MEMORY') ?? DEFAULT_MEMORY,
+    cpus: pick(options.cpus, 'CYBERSEC_SANDBOX_CPUS') ?? DEFAULT_CPUS,
+    pidsLimit: pick(options.pidsLimit, 'CYBERSEC_SANDBOX_PIDS_LIMIT') ?? DEFAULT_PIDS_LIMIT,
+    scratchSize: pick(options.scratchSize, 'CYBERSEC_SANDBOX_SCRATCH_SIZE') ?? DEFAULT_SCRATCH_SIZE,
+    capAdd: parseCapabilities(options.capAdd ?? env.CYBERSEC_SANDBOX_CAP_ADD),
+    allowUnsafeRuntime: (pick(options.allowUnsafeRuntime, 'CYBERSEC_SANDBOX_ALLOW_UNSAFE_RUNTIME') ?? '0') === '1',
+    workspace,
+    workspaceReadonly: truthy(pick(options.workspaceReadonly, 'CYBERSEC_SANDBOX_WORKSPACE_RO')),
+    scope: pick(options.scope, 'CYBERSEC_SANDBOX_SCOPE'),
+    allowStaleImage: (pick(options.allowStaleImage, 'CYBERSEC_SANDBOX_ALLOW_STALE_IMAGE') ?? '0') === '1',
+  };
+};
+
+/**
+ * Pick the Kata runtime to launch under from `docker info` output.
+ *
+ * Kata registers under several names depending on how it was installed, so an
+ * unrequested runtime is matched by pattern rather than assumed.
+ */
+export const selectRuntime = (runtimes, requested, { allowUnsafe = false } = {}) => {
+  const names = Object.keys(runtimes ?? {});
+  const available = names.join(', ') || 'none';
+
+  if (requested) {
+    if (!names.includes(requested)) {
+      throw new Error(`Runtime '${requested}' is not registered with Docker (available: ${available}).`);
+    }
+    return assertKataRuntime(requested, allowUnsafe);
+  }
+
+  const kata = names.filter((name) => isKataRuntime(name)).sort();
+  const chosen = KATA_RUNTIME_PREFERENCE.find((name) => kata.includes(name)) ?? kata[0];
+  if (!chosen) {
+    throw new Error(
+      `No Kata runtime is registered with Docker (available: ${available}). ` +
+        'Install Kata Containers and register it in /etc/docker/daemon.json, ' +
+        'or set CYBERSEC_SANDBOX_RUNTIME. See docs/SANDBOX.md.',
+    );
+  }
+  return chosen;
+};
+
+/** Build the `docker run` argument vector for an idle sandbox VM. `hostArgs` pins a scope's names. */
+export const buildRunArgs = ({ name, runtime, options, env, hostArgs = [] }) => {
+  const args = [
+    'run',
+    '--detach',
+    '--rm',
+    // An init as PID 1 reaps orphaned tool processes; `sleep infinity` would leave
+    // zombies counting against --pids-limit in long sessions.
+    '--init',
+    '--name',
+    name,
+    '--runtime',
+    runtime,
+    '--label',
+    `${SANDBOX_LABEL_KEY}=${SANDBOX_LABEL_VALUE}`,
+    '--user',
+    options.user,
+    '--cap-drop',
+    'ALL',
+    '--security-opt',
+    'no-new-privileges',
+    '--pids-limit',
+    options.pidsLimit,
+    '--memory',
+    options.memory,
+    '--cpus',
+    options.cpus,
+    // A read-only root plus size-capped tmpfs keeps an unpacked sample from filling
+    // the host's Docker storage; under Kata the tmpfs also lives in guest memory.
+    '--read-only',
+  ];
+
+  const [uid, gid = uid] = options.user.split(':');
+  const scratch = [...SCRATCH_PATHS, ...(options.workspace ? [] : [WORKTREE_PATH])];
+  for (const path of scratch) {
+    const mode = path.endsWith('tmp') ? '1777' : '0700';
+    args.push('--tmpfs', `${path}:rw,nosuid,nodev,size=${options.scratchSize},uid=${uid},gid=${gid},mode=${mode}`);
+  }
+
+  // A scope is loaded by a root setup step, which needs NET_ADMIN in the bounding
+  // set. The tool user holds no capabilities and no-new-privileges keeps it so.
+  const capAdd = options.scope && !options.capAdd.includes('NET_ADMIN') ? [...options.capAdd, 'NET_ADMIN'] : options.capAdd;
+  for (const cap of capAdd) args.push('--cap-add', cap);
+  if (options.network) args.push('--network', options.network);
+  args.push(...hostArgs);
+
+  // The only host path the VM can see, and only when the operator names one.
+  if (options.workspace) {
+    args.push('--volume', `${options.workspace}:${WORKTREE_PATH}${options.workspaceReadonly ? ':ro' : ''}`);
+  }
+
+  // Names only: the values travel in the docker CLI's own environment (see
+  // buildExecEnv), so agent keys never appear in the host's process list.
+  args.push(...buildExecEnv(env ?? {}).args);
+
+  args.push('--workdir', WORKTREE_PATH, '--entrypoint', 'sleep', options.image, 'infinity');
+  return args;
+};
+
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Split exec-scoped variables into name-only `--env` flags and the docker CLI's
+ * own environment.
+ *
+ * Docker resolves a bare `--env NAME` from its own environment, so values never
+ * appear in the host process list, and unlike create() variables they never
+ * reach the container's PID 1. DOCKER_* names are refused: the CLI would read
+ * them as its own configuration.
+ */
+export const buildExecEnv = (env = {}, base = process.env) => {
+  const args = [];
+  for (const [name, value] of Object.entries(env)) {
+    if (!ENV_NAME.test(name) || /^DOCKER_/i.test(name)) {
+      throw new Error(`Invalid exec environment variable name '${name}'.`);
+    }
+    if (typeof value !== 'string') throw new Error(`Exec environment variable '${name}' must be a string.`);
+    args.push('--env', name);
+  }
+  return { args, env: { ...base, ...env } };
+};
+
+/** Append to a streamed-output tail, keeping at most `limit` trailing characters. */
+export const appendTail = (tail, chunk, limit = MAX_TAIL_CHARS) => {
+  const next = tail + chunk;
+  return next.length > limit ? next.slice(next.length - limit) : next;
+};
+
+const dockerExec = (args, { maxBuffer = 10 * 1024 * 1024, env } = {}) =>
+  new Promise((resolve, reject) => {
+    execFile('docker', args, { maxBuffer, env }, (error, stdout, stderr) => {
+      if (!error) {
+        resolve(stdout.toString());
+        return;
+      }
+      if (error.code === 'ENOENT') {
+        reject(new Error('docker CLI not found on PATH; see docs/SANDBOX.md for host prerequisites.'));
+        return;
+      }
+      reject(new Error(`docker ${args[0]} failed: ${stderr?.toString().trim() || error.message}`));
+    });
+  });
+
+// docker with a stdin payload; resolves with stdout, rejects on a non-zero exit.
+const dockerExecInput = (args, input) =>
+  new Promise((resolve, reject) => {
+    const child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout = appendTail(stdout, chunk.toString());
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr = appendTail(stderr, chunk.toString());
+    });
+    child.on('error', (error) => reject(new Error(`docker ${args[0]} failed: ${error.message}`)));
+    child.on('close', (code) => {
+      if (code === 0) resolve(stdout);
+      else reject(new Error(stderr.trim() || stdout.trim() || `exit status ${code}`));
+    });
+    child.stdin.on('error', () => {});
+    child.stdin.end(input ?? '');
+  });
+
+const readRuntimes = async () => {
+  const raw = await dockerExec(['info', '--format', '{{json .Runtimes}}']);
+  try {
+    return JSON.parse(raw.trim() || '{}');
+  } catch {
+    throw new Error(`Could not parse the runtime list from 'docker info': ${raw.trim()}`);
+  }
+};
+
+const currentSourceHash = () => {
+  try {
+    return execFileSync('bash', [resolve(_CHECKOUT_ROOT, 'scripts/sandbox-source-hash.sh')], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return '';
+  }
+};
+
+/**
+ * Refuse an image that was not built from this checkout's server sources.
+ *
+ * Such an image runs older server and policy code than the one being read and
+ * reviewed here, and nothing in the session shows it. `current` is empty when
+ * the hash cannot be computed, which leaves staleness unknown.
+ */
+export const assertImageCurrent = (labels, current, image, allowStale = false) => {
+  if (!current || labels?.[SOURCE_HASH_LABEL] === current) return;
+  if (!allowStale) {
+    throw new Error(
+      `Sandbox image '${image}' was not built from this checkout's server sources, so it would run older ` +
+        `server and policy code. Rebuild with: ${BUILD_HINT} (CYBERSEC_SANDBOX_ALLOW_STALE_IMAGE=1 runs it anyway).`,
+    );
+  }
+  process.stderr.write(
+    `WARNING: sandbox image '${image}' was not built from this checkout's server sources; rebuild with: ${BUILD_HINT}\n`,
+  );
+};
+
+const assertImagePresent = async (image, allowStale) => {
+  let raw;
+  try {
+    raw = await dockerExec(['image', 'inspect', image, '--format', '{{json .Config.Labels}}']);
+  } catch {
+    throw new Error(`Sandbox image '${image}' not found. Build it with: ${BUILD_HINT}`);
+  }
+  let labels;
+  try {
+    labels = JSON.parse(raw.trim() || 'null');
+  } catch {
+    return; // Unreadable labels leave staleness unknown; that is no reason to refuse the image.
+  }
+  assertImageCurrent(labels, currentSourceHash(), image, allowStale);
+};
+
+// a is an ancestor of, or equal to, b.
+const _isAncestorOrSame = (a, b) => b === a || b.startsWith(a.endsWith(sep) ? a : a + sep);
+
+// Mounting these (read-write by default) would hand VM code a host path it could
+// use to escape the VM boundary on the next launch. System trees are blocked in
+// both directions (do not mount /etc, nor /etc/x); $HOME and the checkout are
+// blocked only when the workspace is them or above them, so a case directory
+// *under* $HOME still works.
+const _SYSTEM_TREES = [
+  '/etc', '/usr', '/bin', '/sbin', '/lib', '/lib64', '/boot', '/dev', '/proc', '/sys', '/root',
+  '/opt/kata', '/var/lib/docker', '/var/lib/containerd', '/run/docker', '/run/docker.sock', '/run/containerd',
+];
+const _CHECKOUT_ROOT = resolve(import.meta.dirname, '..');
+
+const _realpathOrNull = (p) => {
+  try {
+    return realpathSync(p);
+  } catch {
+    return null;
+  }
+};
+
+export const assertWorkspaceUsable = (workspace) => {
+  if (!workspace) return;
+  let stats;
+  try {
+    stats = statSync(workspace);
+  } catch {
+    throw new Error(`Workspace '${workspace}' does not exist on the host.`);
+  }
+  if (!stats.isDirectory()) throw new Error(`Workspace '${workspace}' is not a directory.`);
+
+  const real = realpathSync(workspace);
+  const refuse = (why) => {
+    throw new Error(`Workspace '${workspace}' ${why}; mount a dedicated case directory instead.`);
+  };
+
+  if (real === '/') refuse('resolves to the host root');
+  for (const tree of _SYSTEM_TREES) {
+    if (_isAncestorOrSame(real, tree) || _isAncestorOrSame(tree, real)) {
+      refuse(`overlaps the system directory ${tree}`);
+    }
+  }
+  const home = _realpathOrNull(homedir());
+  if (home && _isAncestorOrSame(real, home)) refuse('is your home directory or an ancestor of it');
+  const checkout = _realpathOrNull(_CHECKOUT_ROOT);
+  if (checkout && _isAncestorOrSame(real, checkout)) {
+    refuse('is the toolkit checkout or an ancestor of it (VM code could rewrite the launcher)');
+  }
+  // Clients load instruction files, skills and MCP settings from inside the project
+  // tree, so a directory the VM writes to must not be part of it.
+  if (checkout && _isAncestorOrSame(checkout, real)) {
+    refuse('is inside the toolkit checkout (the client would read files the VM writes there as project content)');
+  }
+};
+
+/**
+ * Remove the sandbox on abnormal exit.
+ *
+ * A container that outlives its launcher keeps a VM — and any target access it
+ * was granted — alive, so teardown also runs from the exit and signal paths.
+ * A signal that lands while `pending()` is still booting the VM waits for it:
+ * removing a container that does not exist yet would leave it orphaned.
+ */
+export const registerShutdown = (cleanup, pending = () => undefined, proc = process) => {
+  const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+  const onExit = () => cleanup();
+  const onSignal = (signal) => {
+    const finish = () => {
+      cleanup();
+      proc.exit(signal === 'SIGINT' ? 130 : 143);
+    };
+    const booting = pending();
+    if (booting) booting.then(finish, finish);
+    else finish();
+  };
+
+  proc.on('exit', onExit);
+  for (const signal of signals) proc.on(signal, onSignal);
+
+  return () => {
+    proc.off('exit', onExit);
+    for (const signal of signals) proc.off(signal, onSignal);
+  };
+};
+
+/**
+ * Create a Kata sandbox provider.
+ *
+ * Options fall back to CYBERSEC_SANDBOX_* environment variables, then to
+ * defaults documented in docs/SANDBOX.md.
+ */
+export const kata = (options = {}) => {
+  const resolved = resolveOptions(options);
+
+  return createIsolatedSandboxProvider({
+    name: 'kata',
+    env: options.env,
+    create: async (createOptions) => {
+      assertWorkspaceUsable(resolved.workspace);
+      // Read and resolved before anything boots: a scope that cannot be applied in full stops the launch.
+      const scope = resolved.scope ? await resolveScope(loadScope(resolved.scope)) : null;
+      if (scope && resolved.user.split(':')[0] === '0') {
+        throw new Error('A network scope cannot be enforced when the sandbox user is root; unset CYBERSEC_SANDBOX_USER.');
+      }
+      const runtime = selectRuntime(await readRuntimes(), resolved.runtime, {
+        allowUnsafe: resolved.allowUnsafeRuntime,
+      });
+      if (!isKataRuntime(runtime)) {
+        process.stderr.write(`WARNING: sandbox runtime '${runtime}' is not Kata — tools share the host kernel.\n`);
+      } else if (resolved.allowUnsafeRuntime) {
+        process.stderr.write(
+          `WARNING: CYBERSEC_SANDBOX_ALLOW_UNSAFE_RUNTIME=1 skips the VM-boundary check for runtime '${runtime}'.\n`,
+        );
+      }
+      await assertImagePresent(resolved.image, resolved.allowStaleImage);
+
+      const containerName = `cybersec-kata-${randomUUID()}`;
+      let removed = false;
+      const removeSync = () => {
+        if (removed) return;
+        removed = true;
+        try {
+          execFileSync('docker', ['rm', '--force', containerName], { stdio: 'ignore' });
+        } catch {
+          // Teardown is best-effort; the label allows a manual sweep.
+        }
+      };
+
+      const env = { ...options.env, ...createOptions.env };
+      if (env.CYBERSEC_SANDBOX_MODE === 'kata') {
+        env.CYBERSEC_SANDBOX_MODE = sandboxModeLabel(runtime, resolved.allowUnsafeRuntime);
+      }
+      // The server tells its client where it may connect and records it at start.
+      if (scope) env.CYBERSEC_SANDBOX_SCOPE = summarize(scope);
+
+      // Registered before `docker run`, which is where the VM boots: a signal
+      // in that window must still remove it.
+      let booting;
+      const unregisterShutdown = registerShutdown(removeSync, () => booting);
+      booting = dockerExec(
+        buildRunArgs({
+          name: containerName,
+          runtime,
+          options: resolved,
+          env,
+          hostArgs: scope ? buildHostArgs(scope) : [],
+        }),
+        { env: buildExecEnv(env).env },
+      );
+      try {
+        await booting;
+      } catch (error) {
+        removeSync();
+        unregisterShutdown();
+        throw error;
+      }
+      booting = undefined;
+
+      // Prove the boundary before handing the sandbox out. The name check and
+      // the warning above can be satisfied by a runtime that only calls itself
+      // Kata; this catches one that shares the host kernel. The explicit unsafe
+      // opt-in, warned about above, skips it.
+      if (!resolved.allowUnsafeRuntime) {
+        const teardownAndThrow = (error) => {
+          removeSync();
+          unregisterShutdown();
+          throw error;
+        };
+        let guestBootId;
+        try {
+          guestBootId = (await dockerExec(['exec', containerName, 'cat', BOOT_ID_PATH])).trim();
+        } catch (error) {
+          teardownAndThrow(new Error(`Could not verify the sandbox is a VM: ${error.message}`));
+        }
+        try {
+          assertVmBoundary(guestBootId, readHostBootId(), runtime);
+        } catch (error) {
+          teardownAndThrow(error);
+        }
+      }
+
+      if (scope) {
+        try {
+          await applyScope({ run: dockerExecInput, container: containerName, scope });
+        } catch (error) {
+          removeSync();
+          unregisterShutdown();
+          throw new Error(`Network scope '${scope.name}' could not be enforced: ${error.message}`);
+        }
+        process.stderr.write(`Network scope enforced inside the sandbox — ${summarize(scope)}\n`);
+      }
+
+      return {
+        worktreePath: WORKTREE_PATH,
+
+        exec: (command, opts = {}) =>
+          new Promise((resolve, reject) => {
+            const args = ['exec'];
+            if (opts.stdin !== undefined) args.push('--interactive');
+            // The image ships no sudo binary, so elevation is a uid switch.
+            if (opts.sudo) args.push('--user', '0:0');
+            if (opts.cwd) args.push('--workdir', opts.cwd);
+            args.push(containerName, 'sh', '-c', command);
+
+            const child = spawn('docker', args, {
+              stdio: [opts.stdin !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+            });
+            child.on('error', (error) => reject(new Error(`docker exec failed: ${error.message}`)));
+            if (opts.stdin !== undefined) {
+              child.stdin.write(opts.stdin);
+              child.stdin.end();
+            }
+
+            let stdout = '';
+            let stderr = '';
+            if (opts.onLine) {
+              const lines = createInterface({ input: child.stdout });
+              lines.on('line', (line) => {
+                stdout = appendTail(stdout, `${line}\n`);
+                opts.onLine(line);
+              });
+            } else {
+              child.stdout.on('data', (chunk) => {
+                stdout = appendTail(stdout, chunk.toString());
+              });
+            }
+            child.stderr.on('data', (chunk) => {
+              stderr = appendTail(stderr, chunk.toString());
+            });
+            child.on('close', (code) => resolve({ stdout, stderr, exitCode: code ?? 1 }));
+          }),
+
+        // `opts.env` extends Sandcastle's contract: variables for this process only.
+        interactiveExec: (args, opts) =>
+          new Promise((resolve, reject) => {
+            const execEnv = buildExecEnv(opts.env);
+            const execArgs = ['exec'];
+            execArgs.push('isTTY' in opts.stdin && opts.stdin.isTTY ? '-it' : '--interactive');
+            if (opts.cwd) execArgs.push('--workdir', opts.cwd);
+            execArgs.push(...execEnv.args, containerName, ...args);
+
+            // A stream without a file descriptor (an audit tee, say) cannot be
+            // handed to spawn; pipe that one and keep the rest on direct fds.
+            const stderrHasFd = typeof opts.stderr?.fd === 'number';
+            const child = spawn('docker', execArgs, {
+              stdio: [opts.stdin, opts.stdout, stderrHasFd ? opts.stderr : 'pipe'],
+              env: execEnv.env,
+            });
+            if (!stderrHasFd) child.stderr.pipe(opts.stderr);
+            child.on('error', (error) => reject(new Error(`docker exec failed: ${error.message}`)));
+            child.on('close', (code) => resolve({ exitCode: code ?? 1 }));
+          }),
+
+        copyIn: async (hostPath, sandboxPath) => {
+          await dockerExec(['cp', hostPath, `${containerName}:${sandboxPath}`]);
+        },
+
+        copyFileOut: async (sandboxPath, hostPath) => {
+          await dockerExec(['cp', `${containerName}:${sandboxPath}`, hostPath]);
+        },
+
+        close: async () => {
+          unregisterShutdown();
+          removeSync();
+        },
+      };
+    },
+  });
+};
+
+export default kata;

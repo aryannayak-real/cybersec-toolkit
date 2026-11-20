@@ -1,0 +1,53 @@
+# Force LF line endings for all text files in this repo.
+# Prevents CRLF breakage when shell scripts are checked out on Windows.
+* text=auto eol=lf
+
+# Explicitly mark script types as text (safety net)
+*.sh text eol=lf
+*.bats text eol=lf
+*.conf text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+
+# Binary assets must never get EOL conversion (would corrupt them on Windows checkout).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+
+# Keep repository quality tooling in Git, but omit it from GitHub source archives
+# intended for end users. The Makefile stays: `make sandbox-image` and `make audit-verify` serve users.
+# Integration's distro containers have no git, so checkout fetches this same archive: keep what they run.
+# A $/ action reference is downloaded as this archive, so .github/actions/ has to stay in it.
+.github/* export-ignore
+.github/actions -export-ignore
+tests/ export-ignore
+mcp_server/tests/ export-ignore
+.gitmodules export-ignore
+.gitleaks.toml export-ignore
+.markdownlint.jsonc export-ignore
+scripts/_bash_arrays.py export-ignore
+scripts/audit_skill_dependencies.py export-ignore
+scripts/curate_claude_skills.py export-ignore
+scripts/validate_claude_skills.py export-ignore
+scripts/validate_distro_compat.py export-ignore
+scripts/validate_mcp_sync.py export-ignore
+scripts/validate_tools_config.py export-ignore
+scripts/_skill_frontmatter.py export-ignore
+scripts/_skill_text.py export-ignore
+scripts/bump_version.py export-ignore
+scripts/check_doc_links.py export-ignore
+scripts/pip-audit-lock.sh export-ignore
+scripts/revendor_skills.py export-ignore
+scripts/scan_skills.py export-ignore
+scripts/test-distros.sh export-ignore
+scripts/update-skills.sh export-ignore
+scripts/validate_agent_docs.py export-ignore
+scripts/validate_profiles.sh export-ignore
+scripts/validate_version.sh export-ignore

@@ -1,0 +1,347 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run ShellCheck on all shell scripts
+        run: shellcheck --severity=warning install.sh lib/*.sh modules/*.sh scripts/*.sh
+
+  syntax-check:
+    name: Bash Syntax Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check bash syntax on all shell scripts
+        run: |
+          exit_code=0
+          for f in install.sh lib/*.sh modules/*.sh scripts/*.sh; do
+            if ! bash -n "$f"; then
+              echo "::error file=$f::Syntax error in $f"
+              exit_code=1
+            fi
+          done
+          exit $exit_code
+
+  markdown-lint:
+    name: Markdown Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: DavidAnson/markdownlint-cli2-action@696eb3f2509270d7b882d2aa68347bc676e7af34 # v25.0.0
+        with:
+          globs: |
+            **/*.md
+            !tests/bats/**/*.md
+            !tests/test_helper/**/*.md
+            !mcp_server/.venv/**/*.md
+            !.claude/skills/**/*.md
+            !.agents/skills/**/*.md
+
+  tests:
+    name: Tests (bats-core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Run bats tests
+        run: ./tests/bats/bin/bats tests/*.bats
+
+  tools-config-validate:
+    name: Validate tools_config.json
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cross-validate tools_config.json against module arrays
+        run: python3 scripts/validate_tools_config.py --strict
+
+  distro-compat-validate:
+    name: Validate distro_compat.tsv
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate distro compatibility mappings
+        run: python3 scripts/validate_distro_compat.py
+
+  agent-docs-validate:
+    name: Validate Agent Docs (CLAUDE.md/AGENTS.md)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check CLAUDE.md and AGENTS.md stay consistent
+        run: |
+          python3 scripts/validate_agent_docs.py --selftest
+          python3 scripts/validate_agent_docs.py
+
+      - name: Check release versions match
+        run: bash scripts/validate_version.sh
+
+  claude-skills-validate:
+    name: Validate Claude Skills
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate Claude Code skill metadata
+        run: python3 scripts/validate_claude_skills.py
+
+      - name: Validate Claude Code skill optional dependencies
+        run: python3 scripts/audit_skill_dependencies.py --check-declared
+
+      - name: Validate vendored skill upstream pins are consistent
+        run: bash scripts/update-skills.sh --check-pins
+
+  python-lint:
+    name: Python Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: $/.github/actions/setup-uv
+
+      - name: Lint and format check
+        run: |
+          cd mcp_server && uv sync --locked --group dev --quiet
+          uv run ruff check .
+          uv run ruff format --check .
+          # Also lint the repo-root helper scripts (own ruff.toml at repo root).
+          uv run ruff check ../scripts/ ../lib/
+          uv run ruff format --check ../lib/
+
+  python-tests:
+    name: Python Tests (pytest, ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor pyproject.toml declares (requires-python) up to the current release.
+        python-version: ["3.11", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: $/.github/actions/setup-uv
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run MCP server tests
+        run: cd mcp_server && uv sync --locked --group dev --quiet && uv run pytest tests/ -v
+
+  sandbox-tests:
+    name: Sandbox Provider Tests (node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Pin Node so the tests run on the version the sandbox targets (package.json
+      # engines: >=22), not whatever the runner image happens to ship.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Install sandbox dependencies
+        run: |
+          node --version
+          npm --prefix sandbox ci --ignore-scripts
+
+      - name: Audit sandbox dependencies
+        run: npm --prefix sandbox audit --audit-level=high
+
+      - name: Run sandbox provider tests
+        run: node --test sandbox/*.test.mjs
+
+  mcp-server-check:
+    name: MCP Server Import Check
+    needs:
+      - shellcheck
+      - syntax-check
+      - markdown-lint
+      - tests
+      - tools-config-validate
+      - distro-compat-validate
+      - agent-docs-validate
+      - claude-skills-validate
+      - python-lint
+      - python-tests
+      - profile-validate
+      - sandbox-tests
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Enforce all CI prerequisites
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"' <<<"$NEEDS_JSON")
+          if [[ -n "$failed" ]]; then
+            echo "::error::Required CI jobs did not succeed:"
+            echo "$failed"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: $/.github/actions/setup-uv
+
+      - name: Verify MCP server imports and tool count
+        run: |
+          cd mcp_server && uv sync --locked --quiet
+          uv run python -c "
+          import sys; sys.path.insert(0, '..')
+          from mcp_server.server import mcp, _db
+          assert _db.total_tools > 600, f'Expected 600+ tools (registry sanity floor), got {_db.total_tools}'
+          print(f'MCP server OK: {_db.total_tools} tools, {mcp.name}')
+          "
+
+      - name: Verify cybersec-mcp console script
+        run: |
+          cd mcp_server && uv sync --locked --no-editable --quiet
+          # A plain `uv run` would reinstall the project as editable before the check.
+          uv run --no-editable python - <<'PY'
+          import subprocess
+          import sys
+          import time
+
+          p = subprocess.Popen(
+              ["cybersec-mcp"],
+              stdin=subprocess.PIPE,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.PIPE,
+              text=True,
+          )
+          time.sleep(2)
+          running = p.poll() is None
+          if running:
+              p.terminate()
+          out, err = p.communicate(timeout=5)
+          if not running or "Starting MCP server" not in err:
+              sys.stderr.write(err)
+              sys.exit(1)
+          PY
+
+      - name: Validate MCP data in sync with bash sources
+        run: python3 scripts/validate_mcp_sync.py
+
+      - name: Verify audit-chain tamper detection
+        run: python3 scripts/verify_audit_chain.py --selftest
+
+  profile-validate:
+    name: Validate Profiles
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate profile configs
+        run: bash scripts/validate_profiles.sh

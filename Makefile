@@ -1,0 +1,132 @@
+# Cybersec toolkit — developer & contributor shortcuts.
+# Run `make` or `make help` for the list. Targets cover the core local checks;
+# GitHub also runs security, CodeQL, and integration workflows.
+
+SHELL := bash
+SH_FILES := install.sh lib/*.sh modules/*.sh scripts/*.sh
+# Pinned so a local `make lint-md` matches CI, which uses the SHA-pinned
+# DavidAnson/markdownlint-cli2-action. Bump both together.
+MARKDOWNLINT_VERSION := 0.24.0
+# Paths the CI markdown-lint job skips; applied to tracked and untracked *.md files.
+MD_EXCLUDE :=^tests/bats/|^tests/test_helper/|^mcp_server/\.venv/|^\.claude/skills/|^\.agents/skills/
+
+.DEFAULT_GOAL := help
+.PHONY: help setup lint lint-sh lint-py lint-md format test test-bats test-py test-sandbox validate-packages check-links test-distros \
+	validate check-pins check-skills update-skills scan-skills sync-skills curate check doctor bump mcp docker sandbox-image \
+	audit-verify audit-deps clean
+
+help: ## Show this help
+	@if [ -t 1 ] && [ -z "$${NO_COLOR+x}" ]; then c='\033[36m'; r='\033[0m'; else c=''; r=''; fi; \
+		grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
+		| awk -v c="$$c" -v r="$$r" 'BEGIN{FS=":.*?## "}{printf "  %s%-14s%s %s\n", c, $$1, r, $$2}'
+
+setup: ## One-time dev setup: submodules, MCP deps, sandbox deps, skill mirror (Codex-ready)
+	git submodule update --init --recursive
+	cd mcp_server && uv sync --locked --group dev
+	@if command -v npm >/dev/null 2>&1; then npm --prefix sandbox ci --ignore-scripts; \
+		else echo "npm not found — skipping sandbox deps (see docs/SANDBOX.md)"; fi
+	scripts/sync-skills.sh
+
+lint: lint-sh lint-py lint-md ## Run all linters
+
+# bash -n checks only its first file argument, so each file is checked separately.
+lint-sh: ## shellcheck + bash syntax on all shell scripts
+	shellcheck --severity=warning $(SH_FILES)
+	rc=0; for f in $(SH_FILES); do bash -n "$$f" || rc=1; done; exit $$rc
+
+lint-py: ## ruff check on the MCP server and repo-root scripts
+	cd mcp_server && uv run --group dev ruff check . && uv run --group dev ruff format --check . \
+		&& uv run --group dev ruff check ../scripts/ ../lib/ \
+		&& uv run --group dev ruff format --check ../lib/
+
+lint-md: ## markdownlint on tracked and untracked docs (mirrors the CI job)
+	git ls-files --cached --others --exclude-standard '*.md' | grep -vE '$(MD_EXCLUDE)' | xargs npx --yes markdownlint-cli2@$(MARKDOWNLINT_VERSION)
+
+format: ## Auto-format the MCP server with ruff
+	cd mcp_server && uv run --group dev ruff format .
+
+test: test-bats test-py test-sandbox ## Run all tests
+
+test-bats: ## Bash unit tests (bats)
+	./tests/bats/bin/bats tests/*.bats
+
+test-py: ## MCP server tests (pytest)
+	cd mcp_server && uv run --group dev pytest tests/ -q
+
+test-sandbox: ## Kata sandbox provider tests (node --test; needs sandbox deps)
+	@if [ -d sandbox/node_modules ]; then node --test sandbox/*.test.mjs; \
+	else echo "ERROR: sandbox deps missing — run 'npm --prefix sandbox ci --ignore-scripts' (or 'make setup')" >&2; exit 1; fi
+
+validate: ## Run every data-consistency validator (tools, MCP sync, distros, skills, profiles, version, agent docs)
+	python3 scripts/validate_tools_config.py --strict
+	python3 scripts/validate_mcp_sync.py
+	python3 scripts/validate_distro_compat.py
+	python3 scripts/validate_claude_skills.py
+	python3 scripts/audit_skill_dependencies.py --check-declared
+	bash scripts/update-skills.sh --check-pins
+	python3 scripts/validate_agent_docs.py
+	python3 scripts/verify_audit_chain.py --selftest
+	bash scripts/validate_profiles.sh
+	bash scripts/validate_version.sh
+
+validate-packages: ## Check every mapped package name exists in this distro's repos (needs network)
+	bash scripts/validate_distro_packages.sh
+
+check-links: ## Report dead external links in tracked Markdown (needs network)
+	python3 scripts/check_doc_links.py
+
+test-distros: ## Smoke-test install across apt/dnf/pacman/zypper in containers (needs podman/docker)
+	bash scripts/test-distros.sh
+
+check-pins: ## Assert vendored-skill upstream pins agree across all sources (offline)
+	bash scripts/update-skills.sh --check-pins
+
+check-skills: ## Report vendored-skill drift against upstream (clones sources)
+	bash scripts/update-skills.sh
+
+update-skills: ## Merge upstream changes into the vendored skills and bump the pins (clones sources)
+	bash scripts/update-skills.sh --apply
+
+scan-skills: ## Scan the skills changed since HEAD with SkillSpector (static; needs network)
+	python3 scripts/scan_skills.py --changed-since HEAD
+
+sync-skills: ## Mirror .claude/skills/ -> .agents/skills/ (for Codex and AGENTS.md tools)
+	scripts/sync-skills.sh
+
+curate: ## Regenerate skill curation + requirements (run after adding/removing a skill)
+	python3 scripts/curate_claude_skills.py --write
+	python3 scripts/audit_skill_dependencies.py --write-requirements
+
+check: lint validate test ## Run the core local checks before pushing
+
+doctor: ## Report environment readiness (distro, prereqs, MCP, skills)
+	./install.sh --doctor
+
+bump: ## Bump version across every release surface (usage: make bump VERSION=x.y.z)
+	@test -n "$(VERSION)" || { echo "usage: make bump VERSION=x.y.z"; exit 2; }
+	python3 scripts/bump_version.py "$(VERSION)"
+	cd mcp_server && uv lock
+	bash scripts/validate_version.sh
+
+mcp: ## Launch the MCP server inspector (web UI)
+	cd mcp_server && uv run fastmcp dev inspector server.py
+
+docker: ## Build the Docker image
+	docker build -t cybersec-toolkit .
+
+sandbox-image: ## Build the Kata sandbox image used by scripts/mcp-launch.sh (TOOLKIT_PROFILE=ctf bakes in a profile)
+	docker build -f sandbox/Dockerfile \
+		--build-arg SANDBOX_SOURCE_HASH="$$(bash scripts/sandbox-source-hash.sh)" \
+		$(if $(TOOLKIT_PROFILE),--build-arg TOOLKIT_PROFILE='$(TOOLKIT_PROFILE)') \
+		-t cybersec-toolkit-sandbox:latest .
+
+audit-deps: ## Audit every version pinned in mcp_server/uv.lock for known vulnerabilities (needs network)
+	bash scripts/pip-audit-lock.sh
+
+audit-verify: ## Check the audit log's hash chain (usage: make audit-verify [LOG=path] [STRICT=1])
+	python3 scripts/verify_audit_chain.py $(if $(STRICT),--strict) $(if $(LOG),"$(LOG)")
+
+clean: ## Remove Python caches and test artifacts
+	find . -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+	find . -type d -name .pytest_cache -prune -exec rm -rf {} + 2>/dev/null || true
+	rm -rf mcp_server/.ruff_cache 2>/dev/null || true

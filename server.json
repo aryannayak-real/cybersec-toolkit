@@ -1,0 +1,46 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.aryannayak-real/cybersec-toolkit",
+  "description": "MCP server that catalogs 670+ security tools and runs installed ones under a scope and audit policy.",
+  "version": "1.5.0",
+  "repository": {
+    "url": "https://github.com/aryannayak-real/cybersec-toolkit",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/aryannayak-real/cybersec-toolkit:1.5.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeArguments": [
+        { "type": "named", "name": "--entrypoint", "value": "uv" },
+        { "type": "named", "name": "--security-opt", "value": "no-new-privileges" }
+      ],
+      "packageArguments": [
+        { "type": "positional", "value": "run" },
+        { "type": "positional", "value": "--directory" },
+        { "type": "positional", "value": "mcp_server" },
+        { "type": "positional", "value": "fastmcp" },
+        { "type": "positional", "value": "run" },
+        { "type": "positional", "value": "server.py" },
+        { "type": "positional", "value": "--transport" },
+        { "type": "positional", "value": "stdio" },
+        { "type": "positional", "value": "--no-banner" }
+      ],
+      "environmentVariables": [
+        {
+          "name": "CYBERSEC_MCP_ALLOW_EXTERNAL",
+          "description": "Set to 1 only for explicitly authorized external scopes.",
+          "default": "0"
+        },
+        {
+          "name": "CYBERSEC_MCP_ALLOW_SCRIPTS",
+          "description": "Set to 1 to enable unsandboxed run_script execution.",
+          "default": "0"
+        }
+      ]
+    }
+  ]
+}

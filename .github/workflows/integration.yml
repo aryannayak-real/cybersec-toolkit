@@ -1,0 +1,368 @@
+name: Integration
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    # Run on installer/Docker-touching PRs so breakage is caught pre-merge, not only weekly.
+    paths:
+      - "install.sh"
+      - "lib/**"
+      - "modules/**"
+      - "profiles/**"
+      - "scripts/**"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "sandbox/**"
+      - "mcp_server/**"
+      - "tests/**"
+      - ".github/workflows/integration.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 0"   # Weekly Sunday at 03:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed by event: a push to main must not cancel the weekly run, the only main run of the
+  # canary, sandbox-smoke and Docker jobs.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: "${{ matrix.distro }} integration"
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    container:
+      image: "${{ matrix.image }}" # zizmor: ignore[unpinned-images] rolling distros are tested at their current release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: ubuntu
+            image: ubuntu:26.04
+          - distro: fedora
+            image: fedora:45
+          - distro: arch
+            image: archlinux:latest
+          - distro: opensuse
+            image: opensuse/tumbleweed:latest
+
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install prerequisites (Ubuntu)
+        if: matrix.distro == 'ubuntu'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl wget sudo ca-certificates
+
+      - name: Install prerequisites (Fedora)
+        if: matrix.distro == 'fedora'
+        run: dnf install -y git curl wget sudo which
+
+      - name: Install prerequisites (Arch)
+        if: matrix.distro == 'arch'
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed git curl wget sudo which
+
+      - name: Install prerequisites (openSUSE)
+        if: matrix.distro == 'opensuse'
+        run: |
+          printf '%s\n' \
+            'download.max_silent_tries = 10' \
+            'download.transfer_timeout = 300' \
+            'download.connect_timeout = 60' >> /etc/zypp/zypp.conf
+          {
+            echo "ZYPPER_REFRESH_ATTEMPTS=5"
+            echo "ZYPPER_REFRESH_DELAY=20"
+          } >> "$GITHUB_ENV"
+
+          zypper_refresh() {
+            attempt=1
+            delay=15
+            max_attempts=5
+            while [ "$attempt" -le "$max_attempts" ]; do
+              if zypper --non-interactive --gpg-auto-import-keys refresh --force; then
+                return 0
+              fi
+              if [ "$attempt" -eq "$max_attempts" ]; then
+                return 1
+              fi
+              echo "zypper refresh failed (attempt ${attempt}/${max_attempts}); cleaning metadata and retrying in ${delay}s" >&2
+              zypper --non-interactive clean --all || true
+              sleep "$delay"
+              delay=$((delay * 2))
+              attempt=$((attempt + 1))
+            done
+          }
+
+          zypper_refresh
+          zypper --non-interactive install git curl wget sudo which awk
+
+      - name: Validate package names resolve on this distro
+        # --dry-run never asks the package manager whether a name exists; this
+        # blocking gate fails on package names the distro no longer ships.
+        run: bash scripts/validate_distro_packages.sh
+
+      - name: Create an unprivileged build user
+        # Containers run as root without SUDO_USER; a real user exercises the _as_builder privilege drop.
+        run: |
+          useradd -m builder 2>/dev/null || true
+          echo "SUDO_USER=builder" >> "$GITHUB_ENV"
+
+      - name: Dry-run full profile
+        run: bash install.sh --dry-run --profile full
+
+      - name: Install networking subset
+        run: |
+          # Install a few fast, universally-available packages to test the real
+          # install path including fixup_package_names and pkg_install.
+          bash install.sh --tool nmap --tool curl --tool tcpdump --tool socat --tool whois
+
+      - name: Show install log
+        # Separate step: the default `bash -e` shell stops at a failed install before any later line runs.
+        if: failure()
+        run: |
+          if [ -f cybersec_install.log ]; then
+            cat cybersec_install.log
+          fi
+
+      - name: Verify installed tools
+        run: |
+          for tool in nmap curl tcpdump socat whois; do
+            if command -v "$tool" >/dev/null 2>&1; then
+              echo "OK: $tool"
+            else
+              echo "FAIL: $tool"
+              exit 1
+            fi
+          done
+
+      - name: Run verify script (smoke test)
+        # Smoke test only: verify.sh exits non-zero for the module tools this job did not install.
+        run: bash scripts/verify.sh --module networking --summary || true
+
+      - name: Remove networking module
+        run: bash scripts/remove.sh --module networking --yes
+
+  method-canaries:
+    name: "${{ matrix.method }} method canary"
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - method: pipx
+            tool: factordb-python
+            verify: factordb
+          - method: go
+            tool: anew
+            verify: anew
+          # Exercise Cargo's privilege-drop build path.
+          - method: cargo
+            tool: feroxbuster
+            verify: feroxbuster
+          - method: binary
+            tool: gitleaks
+            verify: gitleaks
+          - method: git
+            tool: linux-smart-enumeration
+            verify: /opt/linux-smart-enumeration
+          - method: source
+            tool: massdns
+            verify: /opt/massdns/bin/massdns
+
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Install through the real single-tool path
+        env:
+          METHOD: ${{ matrix.method }}
+          TOOL: ${{ matrix.tool }}
+          # Authenticate GitHub API calls (raises rate limit 60→5000/hr).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          extra_args=()
+          [[ "$METHOD" == "binary" ]] && extra_args+=(--production)
+          sudo --preserve-env=GITHUB_TOKEN bash install.sh --tool "$TOOL" "${extra_args[@]}"
+
+      - name: Verify canary result
+        env:
+          VERIFY: ${{ matrix.verify }}
+        run: |
+          if [[ "$VERIFY" == /* ]]; then
+            test -e "$VERIFY"
+          else
+            command -v "$VERIFY"
+          fi
+
+  sandbox-smoke:
+    name: Sandbox image smoke test
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build sandbox image
+        run: |
+          docker build --pull -f sandbox/Dockerfile \
+            --build-arg SANDBOX_SOURCE_HASH="$(bash scripts/sandbox-source-hash.sh)" \
+            --tag cybersec-toolkit-sandbox:latest .
+
+      - name: Install sandbox dependencies
+        run: npm --prefix sandbox ci --ignore-scripts
+
+      - name: Drive an MCP handshake through the sandbox
+        env:
+          CYBERSEC_MCP_AUDIT_LOG: ${{ runner.temp }}/sandbox-audit.log
+          # Hosted runners have no KVM, so the plumbing runs under runc: this
+          # proves the image, the stdio bridge and the audit mirror, not the VM
+          # boundary. Kata itself still needs a manual run on a KVM host.
+          CYBERSEC_SANDBOX_RUNTIME: runc
+          CYBERSEC_SANDBOX_ALLOW_UNSAFE_RUNTIME: "1"
+        run: node sandbox/smoke.mjs
+
+      - name: Verify the audit chain that crossed the boundary
+        # The log starts empty in this job, so every chain has to be complete.
+        run: python3 scripts/verify_audit_chain.py --strict "$RUNNER_TEMP/sandbox-audit.log"
+
+      # The rules are the same under runc and Kata; only the kernel that holds them differs.
+      - name: Enforce a network scope against a throwaway target
+        env:
+          CYBERSEC_SANDBOX_RUNTIME: runc
+          CYBERSEC_SANDBOX_ALLOW_UNSAFE_RUNTIME: "1"
+        run: node sandbox/scope-smoke.mjs
+
+      # A runtime named like Kata that shares the host kernel must be refused by the boot-id check.
+      - name: Refuse a runc runtime registered under a Kata name
+        run: |
+          conf=/etc/docker/daemon.json
+          [[ -s "$conf" ]] || echo '{}' | sudo tee "$conf" >/dev/null
+          jq '.runtimes["kata-impostor"] = {"path": "runc"}' "$conf" | sudo tee "$conf.new" >/dev/null
+          sudo mv "$conf.new" "$conf"
+          sudo systemctl restart docker
+          if CYBERSEC_SANDBOX_RUNTIME=kata-impostor CYBERSEC_SMOKE_TIMEOUT_MS=60000 \
+              node sandbox/smoke.mjs > "$RUNNER_TEMP/impostor.log" 2>&1; then
+            echo "::error::a runc runtime named like Kata was accepted"
+            exit 1
+          fi
+          grep -q "identical boot id" "$RUNNER_TEMP/impostor.log"
+
+      - name: Scan image for fixable HIGH/CRITICAL vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: cybersec-toolkit-sandbox:latest
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+
+  docker-build:
+    name: Docker image build
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Build installer image
+        run: docker build --pull --tag cybersec-toolkit:ci .
+
+      - name: Verify default container command
+        run: docker run --rm cybersec-toolkit:ci
+
+      - name: Scan image for fixable HIGH/CRITICAL vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: cybersec-toolkit:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+
+  # The canary, sandbox and image jobs run on main only in the weekly run, so a
+  # failure there is otherwise seen by whoever opens the Actions tab.
+  report-weekly:
+    name: Report the weekly run
+    needs: [integration, method-canaries, sandbox-smoke, docker-build]
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Open, update or close the tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | "- \(.key): \(.value.result)"' <<<"$NEEDS_JSON")
+          existing=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&labels=integration-failure" \
+            --jq '[.[] | select(.pull_request == null)][0].number // empty')
+
+          if [[ -z "$failed" ]]; then
+            if [[ -n "$existing" ]]; then
+              gh issue close "$existing" --repo "$GITHUB_REPOSITORY" \
+                --comment "The weekly integration run passed: $RUN_URL"
+            fi
+            exit 0
+          fi
+
+          {
+            echo "The weekly integration run did not pass:"
+            echo
+            echo "$failed"
+            echo
+            echo "Run: $RUN_URL"
+            echo
+            echo "These jobs install from live package repositories and upstream releases, so a"
+            echo "failure usually follows a change upstream, not a commit here."
+          } > issue-body.md
+
+          if [[ -n "$existing" ]]; then
+            gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" --body-file issue-body.md
+          else
+            gh label create integration-failure --repo "$GITHUB_REPOSITORY" \
+              --description "The weekly integration run failed" --color d93f0b 2>/dev/null || true
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "Weekly integration run failed" \
+              --body-file issue-body.md --label integration-failure
+          fi

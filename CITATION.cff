@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this toolkit in your work, please cite it."
+title: "cybersec-toolkit"
+abstract: >-
+  Modular installer for 670+ cybersecurity tools on Linux and Termux, bundled
+  with a vendor-neutral Model Context Protocol (MCP) server that lets any
+  MCP-capable AI client query the registry and drive installed tools through a
+  governed execution path.
+type: software
+authors:
+  - family-names: "Nayak"
+    given-names: "Aryan"
+repository-code: "https://github.com/aryannayak-real/cybersec-toolkit"
+url: "https://github.com/aryannayak-real/cybersec-toolkit"
+license: MIT
+version: "1.5.0"
+keywords:
+  - cybersecurity
+  - penetration-testing
+  - model-context-protocol
+  - ctf
+  - bug-bounty
+  - incident-response

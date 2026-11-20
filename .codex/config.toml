@@ -1,0 +1,20 @@
+# Codex MCP configuration for cybersec-toolkit.
+#
+# Codex's primary config is ~/.codex/config.toml. If Codex does not pick up this
+# project-level file, copy the [mcp_servers.cybersec-tools] block into your home
+# config (~/.codex/config.toml).
+#
+# Resolves the Git root first so the config works even when Codex is launched
+# from a subdirectory. Script execution and external network targets are
+# disabled by default.
+
+[mcp_servers.cybersec-tools]
+command = "bash"
+args = [
+    "-lc",
+    "cd \"$(git rev-parse --show-toplevel)\" && exec bash scripts/mcp-launch.sh",
+]
+
+[mcp_servers.cybersec-tools.env]
+CYBERSEC_MCP_ALLOW_EXTERNAL = "0"
+CYBERSEC_MCP_ALLOW_SCRIPTS = "0"

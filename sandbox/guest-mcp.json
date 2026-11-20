@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cybersec-tools": {
+      "command": "/opt/cybersec-toolkit/mcp_server/.venv/bin/python",
+      "args": ["-P", "-m", "mcp_server.server"]
+    }
+  }
+}

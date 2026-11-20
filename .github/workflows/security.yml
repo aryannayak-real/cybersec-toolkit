@@ -1,0 +1,263 @@
+name: Security
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    name: Secret Detection (Gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The action's default, 8.24.3, ignores the [[allowlists]] blocks in .gitleaks.toml.
+          GITLEAKS_VERSION: "8.30.1"
+
+  custom-security-scan:
+    name: Custom Security Scanner
+    needs:
+      - gitleaks
+      - pip-audit
+      - pin-check
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Enforce security prerequisites
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"' <<<"$NEEDS_JSON")
+          if [[ -n "$failed" ]]; then
+            echo "::error::Required security jobs did not succeed:"
+            echo "$failed"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run security checks on shell scripts
+        run: |
+          errors=0
+          warnings=0
+
+          echo "=== Cybersec Toolkit — Security Scan ==="
+          echo ""
+
+          for f in install.sh lib/*.sh modules/*.sh scripts/*.sh; do
+            # 1. Hardcoded IPs (allowlist: loopback, RFC 5737)
+            while IFS= read -r match; do
+              ip=$(echo "$match" | grep -oP '\d+\.\d+\.\d+\.\d+')
+              case "$ip" in
+                127.0.0.1|0.0.0.0) continue ;;
+                192.0.2.*|198.51.100.*|203.0.113.*) continue ;; # RFC 5737
+              esac
+              echo "::error file=$f::Hardcoded IP found: $ip"
+              errors=$((errors + 1))
+            done < <(grep -nP '\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b' "$f" \
+              | grep -vP '^\d+:\s*#' | grep -v '127\.0\.0\.1' | grep -v '0\.0\.0\.0' \
+              | grep -v '192\.0\.2\.' | grep -v '198\.51\.100\.' | grep -v '203\.0\.113\.' || true)
+
+            # 2. Potential hardcoded secrets
+            while IFS= read -r match; do
+              line_number=${match%%:*}
+              echo "::error file=$f,line=$line_number::Potential hardcoded secret"
+              errors=$((errors + 1))
+            done < <(grep -nPi '(API_KEY|TOKEN|PASSWORD|SECRET)\s*=\s*["\x27][^"\x27$]{8,}' "$f" \
+              | grep -vP '^\d+:\s*#' || true)
+
+            # 3. HTTP URLs (non-HTTPS)
+            while IFS= read -r match; do
+              echo "::error file=$f::Non-HTTPS URL: $match"
+              errors=$((errors + 1))
+            done < <(grep -nP 'http://' "$f" \
+              | grep -vP '^\d+:\s*#' \
+              | grep -v 'localhost' \
+              | grep -v 'example\.com' \
+              | grep -v '127\.0\.0\.1' \
+              | grep -v 'http://\$' \
+              | grep -vF 'https?://' || true)
+
+            # 4. Unsafe eval usage
+            while IFS= read -r match; do
+              echo "::error file=$f::Unsafe eval: $match"
+              errors=$((errors + 1))
+            done < <(grep -nP '\beval\b' "$f" | grep -vP '^\d+:\s*#' || true)
+
+            # 5. Predictable temp files (warning, not error)
+            while IFS= read -r match; do
+              echo "::warning file=$f::Predictable temp file (consider mktemp): $match"
+              warnings=$((warnings + 1))
+            done < <(grep -nP '/tmp/\w+' "$f" \
+              | grep -vP '^\d+:\s*#' \
+              | grep -v 'mktemp' || true)
+
+            # 6. Overly permissive chmod
+            while IFS= read -r match; do
+              echo "::error file=$f::Overly permissive chmod: $match"
+              errors=$((errors + 1))
+            done < <(grep -nP 'chmod\s+(777|666)' "$f" | grep -vP '^\d+:\s*#' || true)
+
+            # 7. curl|bash / wget|bash patterns
+            while IFS= read -r match; do
+              # Allowlist: rustup (TLS pinning), foundry (no alternative installer), uv/astral (official installer)
+              if echo "$match" | grep -qE 'rustup|foundry|paradigm\.xyz|astral\.sh'; then
+                continue
+              fi
+              echo "::warning file=$f::curl-pipe-bash pattern: $match"
+              warnings=$((warnings + 1))
+            done < <(grep -nP 'curl.*\|\s*(ba)?sh|wget.*\|\s*(ba)?sh' "$f" \
+              | grep -vP '^\d+:\s*#' || true)
+          done
+
+          echo ""
+          echo "=== Scan Complete ==="
+          echo "Errors:   $errors"
+          echo "Warnings: $warnings"
+          echo ""
+
+          if [[ $errors -gt 0 ]]; then
+            echo "::error::Security scan found $errors error(s) — failing build"
+            exit 1
+          fi
+
+          if [[ $warnings -gt 0 ]]; then
+            echo "Security scan passed with $warnings warning(s)"
+          else
+            echo "Security scan passed — no issues found"
+          fi
+
+  pip-audit:
+    name: Python Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: $/.github/actions/setup-uv
+
+      - name: Audit MCP server dependencies
+        run: |
+          (cd mcp_server && uv sync --locked --quiet)
+          # Every pinned version, extras included, whatever Python its marker names.
+          bash scripts/pip-audit-lock.sh
+
+  pin-check:
+    name: Enforce SHA-pinned Actions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check all actions are SHA-pinned
+        run: |
+          errors=0
+          echo "=== Checking GitHub Actions are SHA-pinned ==="
+
+          for wf in .github/workflows/*.yml .github/workflows/*.yaml .github/actions/*/action.yml; do
+            [[ -f "$wf" ]] || continue
+            # Skip same-repository ($/, ./) and docker:// references; the anchored grep never matches a commented line.
+            while IFS= read -r line; do
+              ref=$(echo "$line" | grep -oP 'uses:\s*\K\S+')
+
+              if echo "$ref" | grep -qE '^\$/|^\./|^docker://'; then
+                continue
+              fi
+
+              if ! echo "$ref" | grep -qP '@[0-9a-f]{40}'; then
+                echo "::error file=$wf::Action not SHA-pinned: $ref"
+                errors=$((errors + 1))
+              fi
+            done < <(grep -n '^\s*-\?\s*uses:' "$wf" || true)
+          done
+
+          echo ""
+          if [[ $errors -gt 0 ]]; then
+            echo "::error::Found $errors action(s) without SHA pinning — use full commit SHA instead of tags"
+            exit 1
+          fi
+          echo "All actions are SHA-pinned"
+
+      - uses: $/.github/actions/setup-uv
+
+      - name: Audit workflows and Dependabot config (zizmor)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # The release is pinned; the cooldown covers the dependencies it resolves at run time.
+        run: uvx --exclude-newer "5 days" zizmor@1.32.0 --format=github .github/
+
+  scorecard:
+    name: OSSF Scorecard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.event.repository.private == false
+    permissions:
+      contents: read
+      security-events: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
+
+      - uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+          # .gitattributes export-ignores .github/workflows, so the default archive mode never sees the workflows.
+          file_mode: git
+
+      - uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: results.sarif

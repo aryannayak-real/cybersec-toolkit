@@ -1,0 +1,80 @@
+# Security Policy
+
+## Reporting a vulnerability
+
+Please report vulnerabilities privately using GitHub Security Advisories:
+
+**<https://github.com/aryannayak-real/cybersec-toolkit/security/advisories/new>**
+
+Include:
+
+- A description of the issue and its impact
+- Steps to reproduce
+- Affected file(s) and line number(s) if known
+- A suggested fix, if you have one
+
+Expect an initial response within 7 days. Credit is given in the release notes unless you request otherwise.
+
+**Do not** open public issues or pull requests with proof-of-concept exploits, and do not post details to social media or mailing lists before a fix is released.
+
+## Scope
+
+**In scope:**
+
+- Code execution, privilege escalation, or sandbox escape in the installer (`install.sh`, `lib/`, `modules/`, `scripts/`)
+- Command injection, path traversal, or argument-sanitization bypass in the MCP server (`mcp_server/`)
+- VM-boundary bypass or host exposure in the execution sandbox (`sandbox/`, `scripts/mcp-launch.sh`)
+- Supply-chain weaknesses in project bootstrap/runtime or installer logic: unverified downloads, checksum bypasses, dependency update weaknesses, or fetching the wrong upstream artifact through our scripts
+- Secrets leakage in tracked files, config samples, or local state the toolkit writes (`.versions`, audit logs)
+- CI/CD pipeline weaknesses: unpinned actions, missing egress controls, unauthenticated artifact uploads
+
+**Out of scope:**
+
+- Vulnerabilities in the third-party tools this project installs — report those to the respective upstream projects
+- Issues that require a malicious user to already have `sudo` / root on the target machine
+- Known limitations documented in the README's "Trust & safety" and "Supply chain model" sections (e.g., `--fast` skipping checksums by design — this is documented behavior, not a vulnerability)
+- Attacks against authorized targets (this is a tool for offensive security — misuse by an operator against unauthorized targets is a policy issue, not a vulnerability)
+
+## Supported versions
+
+The latest release and the `main` branch are supported. This project does not maintain backports.
+
+## Supply-chain hardening (existing protections)
+
+For context when evaluating a report:
+
+- **System packages** — GPG-signed via the distro's repos (apt, dnf, pacman, zypper, pkg)
+- **Binary releases** — SHA256-verified against published checksums when available. `--production` or `--require-checksums` turns missing checksums into a hard failure
+- **Go SDK** — SHA256-verified against `go.dev/dl/?mode=json` when reachable
+- **MCP Python dependencies** — resolved by `uv` with a 5-day `exclude-newer` release-age window for project runtime dependencies
+- **GitHub Actions** — all SHA-pinned with version comments; `zizmor` audits every workflow and the Dependabot config; `step-security/harden-runner` audits egress in every job that runs on the runner itself (audit mode, not blocking; it cannot observe the four distro-container integration jobs)
+- **MCP execution engine** — tool allowlisting, argument sanitization (blocks `|`, backtick, `$(`, `${`; `;` and `&` pass through as literals since no shell is used), protected write destinations, per-tool blocked flags, private/loopback network and SSH scope by default, rate limiting, and audit logging
+- **Execution sandbox** — the launcher starts the MCP server in a per-session Kata Containers VM by default ([`docs/SANDBOX.md`](docs/SANDBOX.md)); `--local` is the explicit host-mode opt-out. Audit records are hash-chained and mirrored out of the VM
+- **MCP script execution** — off by default; `CYBERSEC_MCP_ALLOW_SCRIPTS=1` is an explicit code-execution opt-in outside the policy layer (OS isolation only from the Kata VM) and is not constrained by `CYBERSEC_MCP_ALLOW_EXTERNAL`
+
+The MCP execution policy is not an OS sandbox. Allowed tools keep the MCP
+process user's permissions, and disabling `run_script` does not prevent a tool
+from launching child processes or loading plugins. The OS boundary is the Kata
+VM; in `--local` mode that user is the operator and there is none.
+
+The network-scope policy (private/loopback by default) validates tool
+*arguments*. `run_pipeline` pipes one step's stdout into the next step's stdin
+without re-validating it, so a stdin-reading network tool (e.g. `httpx`,
+`dnsx`, `naabu`) can receive an external target produced by an earlier step
+that the argument-level policy would reject on its own. Pipelines are a
+no-shell composition primitive, not a network-scope boundary; set
+`CYBERSEC_MCP_ALLOW_EXTERNAL=1` only for authorized external targets.
+
+## Automated security checks
+
+These run on every push to `main` and every pull request via `.github/workflows/security.yml`:
+
+- **gitleaks** — secret detection
+- **custom-security-scan** — hardcoded IPs, secrets, non-HTTPS URLs, unsafe eval, curl-pipe patterns, `chmod 777`
+- **pip-audit** — audits MCP server Python dependencies for known vulnerabilities
+- **pin-check** — enforces SHA-pinned GitHub Actions
+- **scorecard** — OSSF Scorecard (public-repo pushes to main)
+
+## Disclosure
+
+Once a fix is released, the advisory is made public with credit to the reporter (unless they requested otherwise). Embargo periods can be arranged in the private advisory.

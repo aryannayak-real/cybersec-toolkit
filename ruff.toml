@@ -1,0 +1,12 @@
+# Ruff config for the repo-root Python helpers in scripts/ and lib/.
+# The mcp_server/ package is linted separately via its own pyproject.toml.
+line-length = 120
+
+[lint]
+select = ["E", "F", "W", "I"]
+
+[lint.per-file-ignores]
+# Wide keyword/data tables are clearer on one line.
+"scripts/curate_claude_skills.py" = ["E501"]
+"scripts/validate_claude_skills.py" = ["E501"]
+"scripts/audit_skill_dependencies.py" = ["E501"]

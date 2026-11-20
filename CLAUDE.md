@@ -1,0 +1,52 @@
+# Claude Code Project Context
+
+@AGENTS.md
+
+## Claude Code-specific guidance
+
+The imported `AGENTS.md` is the shared contract. Keep architecture, security,
+testing, MCP tool order, approval gates, image validation, writeups, and tool
+contribution rules there. This file contains only Claude Code-specific behavior.
+
+### MCP
+
+- Project MCP configuration: `.mcp.json`.
+- Verify the server and tools with `/mcp` inside Claude Code.
+- The tracked configuration launches the same governed FastMCP server described
+  in `AGENTS.md`; do not bypass its policy layer.
+- For Windows/WSL, use the WSL launch form documented in
+  `mcp_server/README.md` and run `scripts/sync-wsl.sh` after server changes.
+
+### Agent Skills and plugin marketplace
+
+- `.claude/skills/` is the repository source of truth for Agent Skills and is
+  discovered directly by Claude Code.
+- After editing skills, run `scripts/sync-skills.sh` so clients using
+  `.agents/skills/` receive the generated mirror.
+- The repository is a Claude Code plugin marketplace. Its plugin manifest points
+  to `.claude/skills/`; installation is available through
+  `/plugin marketplace add aryannayak-real/cybersec-toolkit`.
+- Skill discovery does not replace the MCP server: skills provide methodology and
+  context, while MCP provides governed discovery and execution.
+
+### Agent guard (hooks)
+
+`.claude/settings.json` wires `scripts/agent-guard.sh` into two hooks: `SessionStart`
+injects the scoped MCP contract, and `PreToolUse` on `Bash` denies a security-tool
+invocation until an advisor entry point has been called this session. Clearance is read
+from the server's audit log rather than from anything the agent says; one
+`guided_assessment`, `suggest_for_ctf` or `suggest_for_bounty` call clears the session
+for four hours, after which the next security-tool invocation needs a fresh one.
+The guard is a routing aid, not a security boundary: anything running as the user can
+write that log, and the MCP policy layer is what enforces execution rules. A sandboxed
+server mirrors its records out to that same host log (`docs/SANDBOX.md`), so the gate
+behaves identically in both launch modes. Repository work is never gated.
+Denials land in `~/.local/state/cybersec-tools-mcp/guard-denials.log`.
+Disable with `CYBERSEC_AGENT_GUARD=0`. Other clients can call the same two modes from
+whatever pre-execution hook they provide — the logic is not Claude Code-specific.
+
+### Claude Code verification
+
+1. Run `/mcp` and confirm `cybersec-tools` is connected.
+2. Confirm a relevant skill can be discovered from `.claude/skills/`.
+3. Run `make check` after the final repository edits.

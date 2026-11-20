@@ -1,0 +1,83 @@
+[project]
+name = "cybersec-tools-mcp"
+version = "1.5.0"
+description = "MCP server for the cybersec-toolkit — query 670+ tools, get recommendations, execute safely"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11.5"
+dependencies = [
+    "fastmcp>=4.1.4,<5.0.0",
+]
+
+[project.optional-dependencies]
+ctf-core = [
+    "requests>=2.31",
+    "pycryptodome>=3.19",
+    "beautifulsoup4>=4.15.0",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+]
+ctf-extra = [
+    "pwntools>=4.11",
+    "z3-solver>=4.12,<6",
+]
+
+[project.scripts]
+cybersec-mcp = "mcp_server.server:main"
+
+[dependency-groups]
+dev = ["pytest>=9.1.1", "pytest-asyncio>=0.24", "ruff>=0.15.16"]
+
+[build-system]
+# uv.lock does not cover the build backend. Its own dependencies resolve under the
+# exclude-newer cooldown below.
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[tool.hatch.build.targets.wheel.force-include]
+"__init__.py" = "mcp_server/__init__.py"
+"advisor_utils.py" = "mcp_server/advisor_utils.py"
+"audit.py" = "mcp_server/audit.py"
+"bounty_advisor.py" = "mcp_server/bounty_advisor.py"
+"ctf_advisor.py" = "mcp_server/ctf_advisor.py"
+"cve_advisor.py" = "mcp_server/cve_advisor.py"
+"guided_assessment.py" = "mcp_server/guided_assessment.py"
+"local_sandbox.py" = "mcp_server/local_sandbox.py"
+"profiles.py" = "mcp_server/profiles.py"
+"remote.py" = "mcp_server/remote.py"
+"sanitize.py" = "mcp_server/sanitize.py"
+"security.py" = "mcp_server/security.py"
+"server.py" = "mcp_server/server.py"
+"tools_db.py" = "mcp_server/tools_db.py"
+
+[tool.hatch.build.targets.wheel.force-include-editable]
+"__init__.py" = "mcp_server/__init__.py"
+"advisor_utils.py" = "mcp_server/advisor_utils.py"
+"audit.py" = "mcp_server/audit.py"
+"bounty_advisor.py" = "mcp_server/bounty_advisor.py"
+"ctf_advisor.py" = "mcp_server/ctf_advisor.py"
+"cve_advisor.py" = "mcp_server/cve_advisor.py"
+"guided_assessment.py" = "mcp_server/guided_assessment.py"
+"local_sandbox.py" = "mcp_server/local_sandbox.py"
+"profiles.py" = "mcp_server/profiles.py"
+"remote.py" = "mcp_server/remote.py"
+"sanitize.py" = "mcp_server/sanitize.py"
+"security.py" = "mcp_server/security.py"
+"server.py" = "mcp_server/server.py"
+"tools_db.py" = "mcp_server/tools_db.py"
+
+[tool.uv]
+exclude-newer = "5 days"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
